@@ -1,0 +1,116 @@
+import { deleteSavedPlan, listSavedPlans, putSavedPlan } from '@/api/saved-plans';
+import {
+  getSavedPlans,
+  removePlan,
+  replaceSavedPlans,
+  savePlan,
+  type SavedPlan,
+} from '@/storage/saved-plans';
+import type { Plan, SavedPlanDto } from '@/types/api';
+
+/**
+ * Keeps the plans on this device and the signed-in account's plans together (#88).
+ *
+ * Plans are always kept on the device first, so the Saved tab works offline. A guest has only the device
+ * copy. When signed in, a save also goes to the account, and syncing:
+ *  - uploads plans that are only on this device (saved as a guest, or while offline), which is how a
+ *    guest's plans move to the account on login;
+ *  - downloads the account's plans saved on other devices;
+ *  - drops device copies that are marked as synced but are gone from the account, because they were
+ *    deleted on another device (without the mark they would be uploaded again).
+ */
+
+// Saving, deleting and syncing run one at a time. Otherwise a sync that read the account's list before a delete
+// could write the deleted plan back, or re-upload it after it was deleted from the account.
+let running: Promise<unknown> = Promise.resolve();
+function oneAtATime<T>(task: () => Promise<T>): Promise<T> {
+  const result = running.then(task, task);
+  running = result.catch(() => undefined);
+  return result;
+}
+
+// React Native's AbortSignal has no throwIfAborted().
+function stopIfAborted(signal?: AbortSignal) {
+  if (signal?.aborted) throw new Error('Sync cancelled');
+}
+
+/** Where a save ended up: also in the account, or on this device only (guest, or the account was unreachable). */
+export type SaveOutcome = 'account' | 'device';
+
+export function savePlanFor(plan: Plan, accessToken: string | null): Promise<SaveOutcome> {
+  return oneAtATime(() => savePlanNow(plan, accessToken));
+}
+
+async function savePlanNow(plan: Plan, accessToken: string | null): Promise<SaveOutcome> {
+  if (accessToken) {
+    try {
+      const saved = await putSavedPlan(accessToken, plan);
+      // Saving a shared plan again keeps its link.
+      await savePlan(plan, { savedAt: saved.savedAt, synced: true, shareUrl: saved.shareUrl });
+      return 'account';
+    } catch (error) {
+      // Offline, signed out meanwhile, or a server problem: keep it here, the next sync uploads it.
+      console.warn('Could not save the plan to the account', error);
+    }
+  }
+  await savePlan(plan);
+  return 'device';
+}
+
+/** Deletes from the account first, so a failure leaves the plan in both places and nothing comes back later. */
+export function removePlanFor(id: string, accessToken: string | null): Promise<void> {
+  return oneAtATime(async () => {
+    if (accessToken) await deleteSavedPlan(accessToken, id);
+    await removePlan(id);
+  });
+}
+
+/** The device copy of a plan saved to the account, with its public link while it is shared. */
+const fromAccount = ({ plan, savedAt, shareUrl }: SavedPlanDto): SavedPlan => ({
+  ...plan,
+  savedAt,
+  synced: true,
+  ...(shareUrl && { shareUrl }),
+});
+
+/** Rejects when the account can't be reached; the plans on the device are then left as they were. */
+export function syncSavedPlans(accessToken: string, signal?: AbortSignal): Promise<SavedPlan[]> {
+  return oneAtATime(() => syncNow(accessToken, signal));
+}
+
+async function syncNow(accessToken: string, signal?: AbortSignal): Promise<SavedPlan[]> {
+  stopIfAborted(signal);
+  const { plans: remote } = await listSavedPlans(accessToken, signal);
+  const remoteIds = new Set(remote.map(({ plan }) => plan.id));
+
+  const snapshot = await getSavedPlans();
+  const uploaded: SavedPlan[] = [];
+  const pending: SavedPlan[] = [];
+  for (const local of snapshot) {
+    if (remoteIds.has(local.id)) continue;
+    if (local.synced) continue; // deleted on another device
+    try {
+      const saved = await putSavedPlan(accessToken, local, signal);
+      uploaded.push(fromAccount(saved));
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      console.warn('Could not upload a saved plan', error);
+      pending.push(local);
+    }
+  }
+
+  // A plan saved while this was running isn't in the snapshot; don't lose it when writing the result.
+  const seen = new Set(snapshot.map((plan) => plan.id));
+  const savedMeanwhile = (await getSavedPlans()).filter((plan) => !seen.has(plan.id));
+
+  const merged = [
+    ...remote.map(fromAccount),
+    ...uploaded,
+    ...pending,
+    ...savedMeanwhile.filter((plan) => !remoteIds.has(plan.id)),
+  ].sort((a, b) => Date.parse(b.savedAt) - Date.parse(a.savedAt));
+  // Signed out (or left the screen) meanwhile: don't write this account's plans back onto the device.
+  stopIfAborted(signal);
+  await replaceSavedPlans(merged);
+  return merged;
+}
